@@ -1,0 +1,12 @@
+QUALITY SAMPLE RANDOMIZER - LOCAL MVP
+
+Windows
+1. Extract this ZIP to a normal local folder.
+2. Ensure Python 3.11+ is installed and available on PATH.
+3. Double-click start_windows.bat.
+4. The first launch installs the local Python environment and opens http://127.0.0.1:8765.
+5. Create your administrator password when prompted.
+
+A Neustar-structure synthetic test workbook is available at sample_data\Neustar_Structured_Sample.xlsx.
+Use Work Order as the identifier and Emp ID as the associate mapping.
+Full operating notes are in README.md.

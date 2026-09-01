@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+data/*.db*
+data/uploads/*
+!data/uploads/.gitkeep
+backups/*.db
+logs/*.log
+.test_qsr_*/
+.visual_demo/
+.date_range_qa/
+.playwright-cli/

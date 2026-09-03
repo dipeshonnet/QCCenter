@@ -9,3 +9,6 @@ logs/*.log
 .visual_demo/
 .date_range_qa/
 .playwright-cli/
+.netlify/
+.npm-cache/
+quality-command-center-site/

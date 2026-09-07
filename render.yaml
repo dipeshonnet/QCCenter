@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: qcc-api
+    runtime: python
+    region: singapore
+    plan: free
+    branch: main
+    autoDeployTrigger: checksPass
+    buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --proxy-headers --forwarded-allow-ips="*" --timeout-keep-alive 5 --limit-concurrency 50 --backlog 128 --timeout-graceful-shutdown 40
+    healthCheckPath: /readyz
+    maxShutdownDelaySeconds: 45
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.15
+      - key: APP_ENV
+        value: staging
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_SSL_ROOT_CERT_FILE
+        value: /etc/secrets/supabase-ca.crt
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: INGEST_BUCKET
+        value: qcc-ingest
+      - key: EXPORT_BUCKET
+        value: qcc-export-temp
+      - key: PUBLIC_ORIGIN
+        sync: false
+      - key: ALLOWED_HOSTS
+        sync: false
+      - key: NETLIFY_SITE_ID
+        sync: false
+      - key: NETLIFY_JWS_SECRET
+        sync: false
+      - key: MAX_UPLOAD_BYTES
+        value: "26214400"
+      - key: MAX_ROWS
+        value: "200000"
+      - key: MAX_COLS
+        value: "250"
+      - key: MAX_JSON_BYTES
+        value: "1048576"

@@ -28,6 +28,7 @@ from app import (
     iso_now,
     password_hash,
 )
+from qcc.database import uses_postgres
 
 router = APIRouter()
 
@@ -54,6 +55,8 @@ def _columns(con, table: str) -> set[str]:
 
 def init_quality_db() -> None:
     """Idempotent v2 schema migration; legacy rows remain untouched."""
+    if uses_postgres():
+        return
     with db() as con:
         con.executescript(
             """

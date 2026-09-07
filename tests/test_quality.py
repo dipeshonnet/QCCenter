@@ -15,6 +15,8 @@ os.environ["QSR_DATA_DIR"] = str(TEST_ROOT / "data")
 os.environ["QSR_BACKUP_DIR"] = str(TEST_ROOT / "backups")
 os.environ["QSR_LOG_DIR"] = str(TEST_ROOT / "logs")
 os.environ["QSR_EXPORT_DIR"] = str(TEST_ROOT / "exports")
+os.environ["DATABASE_URL"] = ""
+os.environ["DIRECT_DATABASE_URL"] = ""
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import app  # noqa: E402

@@ -25,6 +25,11 @@ from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook, load_workbook
 from pydantic import BaseModel, Field
 
+from qcc.config import settings
+from qcc.database import connect as database_connect
+from qcc.database import database, uses_postgres
+from qcc.storage import StorageError, storage
+
 APP_NAME = "Quality Sample Randomizer"
 APP_VERSION = "2.0.0-quality-command-center"
 ALGORITHM_VERSION = "QSR-RANDOM-V1"
@@ -35,9 +40,9 @@ EXPORT_DIR = Path(os.getenv("QSR_EXPORT_DIR", str(BASE_DIR / "exports"))).resolv
 BACKUP_DIR = Path(os.getenv("QSR_BACKUP_DIR", str(BASE_DIR / "backups"))).resolve()
 LOG_DIR = Path(os.getenv("QSR_LOG_DIR", str(BASE_DIR / "logs"))).resolve()
 DB_PATH = DATA_DIR / "quality_randomizer.db"
-MAX_FILE_BYTES = 25 * 1024 * 1024
-MAX_ROWS = 200_000
-MAX_COLS = 250
+MAX_FILE_BYTES = settings.max_upload_bytes
+MAX_ROWS = settings.max_rows
+MAX_COLS = settings.max_cols
 SESSION_HOURS = 8
 REQUIRED_TABLES = {"users", "accounts", "account_config", "sampling_runs", "sample_records", "audit_events", "sessions", "uploads"}
 
@@ -61,27 +66,18 @@ def iso_now() -> str:
 
 
 def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    con = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA journal_mode=WAL")
-    return con
+    return database_connect(db_path)
 
 
 @contextmanager
 def db() -> Iterable[sqlite3.Connection]:
-    con = connect()
-    try:
+    with database(DB_PATH) as con:
         yield con
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
 
 
 def init_db() -> None:
+    if uses_postgres():
+        return
     with db() as con:
         con.executescript(
             """
@@ -246,9 +242,10 @@ def current_user(qsr_session: str | None = Cookie(default=None)) -> str:
 
 def ensure_roles(username: str, *allowed: str) -> None:
     with db() as con:
-        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        if "user_roles" not in tables:
-            return
+        if not uses_postgres():
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "user_roles" not in tables:
+                return
         roles = {r[0] for r in con.execute("SELECT role_name FROM user_roles WHERE username=?", (username,)).fetchall()}
     if not roles.intersection(allowed):
         raise HTTPException(403, "You do not have permission to perform this action")
@@ -524,8 +521,8 @@ def period_key(now: datetime, mode: str) -> str:
 
 
 def build_pool(payload: PreviewIn, upload: dict[str, Any]) -> dict[str, Any]:
-    path = Path(upload["stored_path"])
-    matrix = read_matrix(path, upload["file_type"], payload.sheet_name)
+    with storage.materialize(upload["stored_path"], upload["file_type"]) as path:
+        matrix = read_matrix(path, upload["file_type"], payload.sheet_name)
     headers, records = matrix_to_records(matrix, payload.header_row)
     if payload.identifier_column not in headers:
         raise HTTPException(400, "Identifier column is not present in the selected header row")
@@ -732,6 +729,8 @@ def prune_auto_backups(keep: int = 7) -> None:
 
 
 def ensure_daily_auto_backup() -> None:
+    if uses_postgres():
+        return
     with db() as con:
         initialized = con.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
     if not initialized:
@@ -749,7 +748,7 @@ def cleanup_stale_uploads(hours: int = 24) -> None:
     with db() as con:
         rows = con.execute("SELECT upload_id, stored_path FROM uploads WHERE status='READY' AND created_at < ?", (cutoff,)).fetchall()
         for row in rows:
-            Path(row["stored_path"]).unlink(missing_ok=True)
+            storage.delete(row["stored_path"])
             con.execute("UPDATE uploads SET status='EXPIRED' WHERE upload_id=?", (row["upload_id"],))
     if rows:
         logger.info("expired_uploads=%s", len(rows))
@@ -757,6 +756,24 @@ def cleanup_stale_uploads(hours: int = 24) -> None:
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/readyz", include_in_schema=False)
+def readyz():
+    try:
+        with db() as con:
+            con.execute("SELECT 1").fetchone()
+        if not storage.check_bucket():
+            raise RuntimeError("Storage unavailable")
+        return {"status": "ready"}
+    except Exception:
+        logger.exception("Readiness check failed")
+        return JSONResponse(status_code=503, content={"status": "unavailable"})
 
 
 @app.on_event("startup")
@@ -977,11 +994,14 @@ async def upload_workbook(file: UploadFile = File(...), user: str = Depends(curr
         if not matrix or not any(any(str(v).strip() for v in row) for row in matrix):
             raise HTTPException(400, "File contains no usable data")
         detected_header = detect_header(matrix)
+        stored_reference = storage.put_file(target, storage.object_key(upload_id, ext))
         with db() as con:
             con.execute(
                 "INSERT INTO uploads(upload_id, original_name, stored_path, file_type, sha256, size_bytes, created_at, status) VALUES(?,?,?,?,?,?,?,'READY')",
-                (upload_id, filename, str(target), ext, sha.hexdigest(), size, iso_now()),
+                (upload_id, filename, stored_reference, ext, sha.hexdigest(), size, iso_now()),
             )
+        if storage.remote:
+            target.unlink(missing_ok=True)
         audit("FILE_UPLOADED", user, "upload", upload_id, {"filename": filename, "sha256": sha.hexdigest(), "size_bytes": size})
         return {"upload_id": upload_id, "filename": filename, "sha256": sha.hexdigest(), "size_bytes": size, "sheets": sheets, "detected_header_row": detected_header}
     except Exception:
@@ -993,7 +1013,8 @@ async def upload_workbook(file: UploadFile = File(...), user: str = Depends(curr
 def inspect_upload(upload_id: str, payload: InspectIn, user: str = Depends(current_user)):
     ensure_roles(user, "Administrator", "QA Auditor")
     upload = upload_record(upload_id)
-    matrix = read_matrix(Path(upload["stored_path"]), upload["file_type"], payload.sheet_name)
+    with storage.materialize(upload["stored_path"], upload["file_type"]) as path:
+        matrix = read_matrix(path, upload["file_type"], payload.sheet_name)
     headers, records = matrix_to_records(matrix, payload.header_row)
     if not headers or not records:
         raise HTTPException(400, "Selected header row does not produce usable records")
@@ -1098,7 +1119,7 @@ def generate_run(upload_id: str, payload: RunIn, user: str = Depends(current_use
             (payload.identifier_column, payload.associate_column, now, payload.account_id),
         )
         con.execute("UPDATE uploads SET status='USED' WHERE upload_id=?", (upload_id,))
-    Path(upload["stored_path"]).unlink(missing_ok=True)
+    storage.delete(upload["stored_path"])
     audit("RUN_COMPLETED", user, "run", rid, {"account": account["name"], "selected_count": len(selected), "seed": str(seed)})
     return {"run_id": rid, "selected_count": len(selected), "status": "COMPLETED"}
 

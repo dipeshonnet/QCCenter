@@ -9,7 +9,6 @@ services:
     buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --proxy-headers --forwarded-allow-ips="*" --timeout-keep-alive 5 --limit-concurrency 50 --backlog 128 --timeout-graceful-shutdown 40
     healthCheckPath: /readyz
-    maxShutdownDelaySeconds: 45
     envVars:
       - key: PYTHON_VERSION
         value: 3.13.15

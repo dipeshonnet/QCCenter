@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,6 +25,27 @@ import quality  # noqa: E402
 
 
 class QualityCommandCenterTests(unittest.TestCase):
+    def test_session_expiry_accepts_postgres_and_sqlite_timestamps(self):
+        now = datetime.now(timezone.utc)
+        for as_text in (False, True):
+            for expired in (False, True):
+                with self.subTest(as_text=as_text, expired=expired):
+                    expiry = now + timedelta(hours=-1 if expired else 1)
+                    con = MagicMock()
+                    con.execute.return_value.fetchone.return_value = {
+                        "username": "admin",
+                        "expires_at": expiry.isoformat() if as_text else expiry,
+                    }
+                    with patch.object(app, "db") as database, patch.object(app, "utcnow", return_value=now):
+                        database.return_value.__enter__.return_value = con
+                        if expired:
+                            with self.assertRaises(app.HTTPException) as error:
+                                app.current_user("test-token")
+                            self.assertEqual(error.exception.status_code, 401)
+                            self.assertEqual(error.exception.detail, "Session expired")
+                        else:
+                            self.assertEqual(app.current_user("test-token"), "admin")
+
     def setUp(self):
         with app.db() as con:
             for table in [

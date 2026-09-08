@@ -234,7 +234,10 @@ def current_user(qsr_session: str | None = Cookie(default=None)) -> str:
         row = con.execute("SELECT username, expires_at FROM sessions WHERE token_hash=?", (token_hash,)).fetchone()
         if not row:
             raise HTTPException(401, "Invalid session")
-        if datetime.fromisoformat(row["expires_at"]) < utcnow():
+        expires_at = row["expires_at"]
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at)
+        if expires_at < utcnow():
             con.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash,))
             raise HTTPException(401, "Session expired")
         return row["username"]

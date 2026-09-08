@@ -1,5 +1,21 @@
 # Quality Command Center Verification Report
 
+## Account structure verification — 2026-09-08
+
+- **19 automated tests passed** against disposable SQLite databases, including the original 10 tests and 9 account-structure tests.
+- Account authorization was checked through HTTP endpoints and direct workflow tests: list/aggregate/export isolation, different roles per account, immediate grant removal, upload/import ownership, account/process mismatches, assignees, and foreign scorecard items.
+- Process tests cover independent controls, mapping persistence, coverage and previous-ID history, archive/restore, blocked new work, and completion of existing audits/CAPAs.
+- Scorecard tests cover cloning with new item IDs, metadata/item edits, removal/reordering, publishing, historical result preservation, and concurrent version allocation.
+- SQLite migration tests verify copied controls, removal of global non-Administrator access, retained legacy-role reference, and repeat-startup preservation.
+- Python compilation, JavaScript syntax checks, and `git diff --check` passed. Alembic successfully generated PostgreSQL upgrade SQL through `0002_account_structure`. A live PostgreSQL migration was **not run** because the local Docker engine was unavailable.
+- Playwright checks used a localhost-only server with synthetic data: dependent dropdowns, disabled empty states, save/selection persistence, independent sibling-process controls, scorecard clone/edit/reorder/publish, archive/restore, and user-role round trips. Browser checks exposed and resolved stale scorecard selection and initial table-loading races.
+- Screenshots are saved under `output/playwright/`. Existing dashboard inline-style CSP messages and the missing favicon were observed; the new administration flows produced no JavaScript exceptions.
+- A separate browser session-switch check passed: saved role rows reload correctly, signing out clears cached Administrator screens, a reviewer-only account cannot select a process for sampling, and an auditor account displays its selected process's saved coverage policy.
+
+The upgrade requires Admin to assign account roles to existing non-Administrator users. PostgreSQL migration must run before the matching application release; no production database or deployment was changed during verification.
+
+## Original baseline verification
+
 ## Automated verification
 
 The application was exercised against isolated SQLite workspaces so production data was not modified.

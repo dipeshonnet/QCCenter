@@ -29,6 +29,8 @@ from qcc.config import settings
 from qcc.database import connect as database_connect
 from qcc.database import database, uses_postgres
 from qcc.storage import StorageError, storage
+from qcc import access
+from qcc.account_schema import initialize_process, sampling_config
 
 APP_NAME = "Quality Sample Randomizer"
 APP_VERSION = "2.0.0-quality-command-center"
@@ -245,13 +247,7 @@ def current_user(qsr_session: str | None = Cookie(default=None)) -> str:
 
 def ensure_roles(username: str, *allowed: str) -> None:
     with db() as con:
-        if not uses_postgres():
-            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if "user_roles" not in tables:
-                return
-        roles = {r[0] for r in con.execute("SELECT role_name FROM user_roles WHERE username=?", (username,)).fetchall()}
-    if not roles.intersection(allowed):
-        raise HTTPException(403, "You do not have permission to perform this action")
+        access.require(con, username, allowed=allowed)
 
 
 def account_row(con: sqlite3.Connection, account_id: int) -> sqlite3.Row:
@@ -540,21 +536,21 @@ def build_pool(payload: PreviewIn, upload: dict[str, Any]) -> dict[str, Any]:
         process = con.execute("SELECT id FROM processes WHERE id=? AND account_id=? AND active=1", (payload.process_id, payload.account_id)).fetchone()
         if not process:
             raise HTTPException(400, "Select an active process belonging to this account")
-        cfg = account_config(con, payload.account_id)
+        cfg = sampling_config(con, payload.process_id)
         case_insensitive = bool(cfg["case_insensitive_ids"])
         exclude_previous = bool(cfg["exclude_previously_sampled"])
         previous = set()
         if exclude_previous:
             previous = {
-                r[0]
+                normalize_identifier(r[0], case_insensitive)
                 for r in con.execute(
                     """
-                    SELECT sr.normalized_identifier
+                    SELECT sr.identifier_raw
                     FROM sample_records sr
                     JOIN sampling_runs rr ON rr.run_id=sr.run_id
-                    WHERE rr.account_id=? AND rr.status='COMPLETED'
+                    WHERE rr.process_id=? AND rr.status='COMPLETED'
                     """,
-                    (payload.account_id,),
+                    (payload.process_id,),
                 ).fetchall()
             }
 
@@ -597,7 +593,7 @@ def build_pool(payload: PreviewIn, upload: dict[str, Any]) -> dict[str, Any]:
     cfg_enabled = bool(cfg["coverage_enabled"])
     if cfg_enabled:
         if not payload.associate_column:
-            raise HTTPException(400, "This account enforces coverage sampling; confirm the associate column")
+            raise HTTPException(400, "This process enforces coverage sampling; confirm the associate column")
         pk = period_key(utcnow(), cfg["coverage_period"])
         with db() as con:
             completed_by_associate = {
@@ -607,10 +603,10 @@ def build_pool(payload: PreviewIn, upload: dict[str, Any]) -> dict[str, Any]:
                     SELECT COALESCE(sr.associate,'') associate, COUNT(*) n
                     FROM sample_records sr
                     JOIN sampling_runs rr ON rr.run_id=sr.run_id
-                    WHERE rr.account_id=? AND rr.status='COMPLETED' AND sr.period_key=?
+                    WHERE rr.process_id=? AND rr.status='COMPLETED' AND sr.period_key=?
                     GROUP BY COALESCE(sr.associate,'')
                     """,
-                    (payload.account_id, pk),
+                    (payload.process_id, pk),
                 ).fetchall()
             }
         groups: dict[str, list[dict[str, Any]]] = {}
@@ -863,29 +859,24 @@ def me(user: str = Depends(current_user)):
 @app.get("/api/dashboard")
 def dashboard(user: str = Depends(current_user)):
     with db() as con:
-        metrics = {
-            "accounts": con.execute("SELECT COUNT(*) FROM accounts WHERE active=1").fetchone()[0],
-            "samples": con.execute("SELECT COUNT(*) FROM sample_records sr JOIN sampling_runs r ON r.run_id=sr.run_id WHERE r.status='COMPLETED'").fetchone()[0],
-            "runs": con.execute("SELECT COUNT(*) FROM sampling_runs WHERE status='COMPLETED'").fetchone()[0],
-            "voided_runs": con.execute("SELECT COUNT(*) FROM sampling_runs WHERE status='VOIDED'").fetchone()[0],
-        }
-        summary = [dict(r) for r in con.execute(
-            """
-            SELECT a.id account_id, a.name account,
-                   SUM(CASE WHEN r.status='COMPLETED' THEN 1 ELSE 0 END) runs,
-                   COALESCE(SUM(CASE WHEN r.status='COMPLETED' THEN r.selected_count ELSE 0 END),0) samples,
-                   MAX(CASE WHEN r.status='COMPLETED' THEN r.created_at END) last_run
+        clause, params = access.scope(con, user, "a.id")
+        summary = [dict(r) for r in con.execute(f"""SELECT a.id account_id,a.name account,
+            SUM(CASE WHEN r.status='COMPLETED' THEN 1 ELSE 0 END) runs,
+            COALESCE(SUM(CASE WHEN r.status='COMPLETED' THEN r.selected_count ELSE 0 END),0) samples,
+            SUM(CASE WHEN r.status='VOIDED' THEN 1 ELSE 0 END) voided_runs,
+            MAX(CASE WHEN r.status='COMPLETED' THEN r.created_at END) last_run
             FROM accounts a LEFT JOIN sampling_runs r ON r.account_id=a.id
-            WHERE a.active=1 GROUP BY a.id,a.name ORDER BY a.name COLLATE NOCASE
-            """
-        ).fetchall()]
-    return {"metrics": metrics, "summary": summary}
+            WHERE a.active=1 AND {clause} GROUP BY a.id,a.name ORDER BY a.name""", params).fetchall()]
+    return {"metrics": {"accounts": len(summary), "samples": sum(r["samples"] for r in summary),
+        "runs": sum(r["runs"] for r in summary), "voided_runs": sum(r["voided_runs"] for r in summary)}, "summary": summary}
 
 
 @app.get("/api/accounts")
-def list_accounts(user: str = Depends(current_user)):
+def list_accounts(user: str = Depends(current_user), include_archived: bool = False):
     with db() as con:
-        rows = [dict(r) for r in con.execute("SELECT * FROM accounts WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()]
+        clause, params = access.scope(con, user, "id")
+        active = "1=1" if include_archived else "active=1"
+        rows = [dict(r) for r in con.execute(f"SELECT * FROM accounts WHERE {active} AND {clause} ORDER BY name COLLATE NOCASE", params).fetchall()]
         for row in rows:
             row["config"] = account_config(con, row["id"])
     return rows
@@ -906,6 +897,7 @@ def create_account(payload: AccountIn, user: str = Depends(current_user)):
                 (account_id, "General Service Process", "back_office", now, now),
             )
             con.execute("INSERT INTO process_settings(process_id,updated_at) VALUES(?,?)", (pcur.lastrowid, now))
+            initialize_process(con, pcur.lastrowid, now)
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Account already exists")
     audit("ACCOUNT_CREATED", user, "account", str(account_id), {"name": name})
@@ -925,6 +917,7 @@ def archive_account(account_id: int, user: str = Depends(current_user)):
 @app.get("/api/accounts/{account_id}/config")
 def get_config(account_id: int, user: str = Depends(current_user)):
     with db() as con:
+        access.require(con, user, account_id)
         account_row(con, account_id)
         return account_config(con, account_id)
 
@@ -932,35 +925,7 @@ def get_config(account_id: int, user: str = Depends(current_user)):
 @app.put("/api/accounts/{account_id}/config")
 def save_config(account_id: int, payload: ConfigIn, user: str = Depends(current_user)):
     ensure_roles(user, "Administrator")
-    if payload.coverage_period not in {"day", "week", "month"}:
-        raise HTTPException(400, "Coverage period must be day, week, or month")
-    now = iso_now()
-    with db() as con:
-        account_row(con, account_id)
-        before = account_config(con, account_id)
-        con.execute(
-            """
-            INSERT INTO account_config(account_id, coverage_enabled, coverage_period, audits_per_associate,
-                identifier_column_default, associate_column_default, exclude_previously_sampled, case_insensitive_ids, updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(account_id) DO UPDATE SET
-                coverage_enabled=excluded.coverage_enabled,
-                coverage_period=excluded.coverage_period,
-                audits_per_associate=excluded.audits_per_associate,
-                identifier_column_default=excluded.identifier_column_default,
-                associate_column_default=excluded.associate_column_default,
-                exclude_previously_sampled=excluded.exclude_previously_sampled,
-                case_insensitive_ids=excluded.case_insensitive_ids,
-                updated_at=excluded.updated_at
-            """,
-            (
-                account_id, int(payload.coverage_enabled), payload.coverage_period, payload.audits_per_associate,
-                payload.identifier_column_default, payload.associate_column_default,
-                int(payload.exclude_previously_sampled), int(payload.case_insensitive_ids), now,
-            ),
-        )
-    audit("ACCOUNT_CONFIG_CHANGED", user, "account", str(account_id), {"before": before, "after": payload.model_dump()})
-    return {"ok": True}
+    raise HTTPException(410, "Sampling controls are now per process. Use /api/admin/processes/{process_id}/sampling-controls")
 
 
 @app.post("/api/uploads")
@@ -993,8 +958,8 @@ async def upload_workbook(file: UploadFile = File(...), user: str = Depends(curr
         stored_reference = storage.put_file(target, storage.object_key(upload_id, ext))
         with db() as con:
             con.execute(
-                "INSERT INTO uploads(upload_id, original_name, stored_path, file_type, sha256, size_bytes, created_at, status) VALUES(?,?,?,?,?,?,?,'READY')",
-                (upload_id, filename, stored_reference, ext, sha.hexdigest(), size, iso_now()),
+                "INSERT INTO uploads(upload_id, original_name, stored_path, file_type, sha256, size_bytes, created_at, created_by, status) VALUES(?,?,?,?,?,?,?,?,'READY')",
+                (upload_id, filename, stored_reference, ext, sha.hexdigest(), size, iso_now(), user),
             )
         if storage.remote:
             target.unlink(missing_ok=True)
@@ -1008,6 +973,8 @@ async def upload_workbook(file: UploadFile = File(...), user: str = Depends(curr
 @app.post("/api/uploads/{upload_id}/inspect")
 def inspect_upload(upload_id: str, payload: InspectIn, user: str = Depends(current_user)):
     ensure_roles(user, "Administrator", "QA Auditor")
+    with db() as con:
+        access.staging(con, user, "uploads", "upload_id", upload_id)
     upload = upload_record(upload_id)
     with storage.materialize(upload["stored_path"], upload["file_type"]) as path:
         matrix = read_matrix(path, upload["file_type"], payload.sheet_name)
@@ -1028,6 +995,9 @@ def inspect_upload(upload_id: str, payload: InspectIn, user: str = Depends(curre
 @app.post("/api/uploads/{upload_id}/preview")
 def preview_sample(upload_id: str, payload: PreviewIn, user: str = Depends(current_user)):
     ensure_roles(user, "Administrator", "QA Auditor")
+    with db() as con:
+        access.staging(con, user, "uploads", "upload_id", upload_id)
+        access.process(con, user, payload.process_id, ("QA Auditor",), active=True, account_id=payload.account_id)
     upload = upload_record(upload_id)
     pool_data = build_pool(payload, upload)
     coverage = pool_data["coverage"]
@@ -1053,6 +1023,9 @@ def preview_sample(upload_id: str, payload: PreviewIn, user: str = Depends(curre
 @app.post("/api/uploads/{upload_id}/runs")
 def generate_run(upload_id: str, payload: RunIn, user: str = Depends(current_user)):
     ensure_roles(user, "Administrator", "QA Auditor")
+    with db() as con:
+        access.staging(con, user, "uploads", "upload_id", upload_id)
+        access.process(con, user, payload.process_id, ("QA Auditor",), active=True, account_id=payload.account_id)
     upload = upload_record(upload_id)
     pool_data = build_pool(payload, upload)
     seed = secrets.randbits(63)
@@ -1067,6 +1040,9 @@ def generate_run(upload_id: str, payload: RunIn, user: str = Depends(current_use
     pk = coverage["period_key"] if coverage else None
     method = "coverage" if coverage else payload.sampling_method
     with db() as con:
+        con.execute("UPDATE processes SET updated_at=updated_at WHERE id=?", (payload.process_id,))
+        access.process(con, user, payload.process_id, ("QA Auditor",), active=True, account_id=payload.account_id)
+        initialize_process(con, payload.process_id, now)
         account = account_row(con, payload.account_id)
         con.execute(
             """
@@ -1107,12 +1083,12 @@ def generate_run(upload_id: str, payload: RunIn, user: str = Depends(current_use
                 (audit_id, payload.process_id, rec_cur.lastrowid, f"{rid}:{item['identifier_raw']}",
                  scorecard["id"] if scorecard else None, associate, json.dumps(row, ensure_ascii=False), now, user),
             )
-        # Save successful mappings as account defaults.
+        # Save successful mappings for this process only.
         con.execute(
             """
-            UPDATE account_config SET identifier_column_default=?, associate_column_default=?, updated_at=? WHERE account_id=?
+            UPDATE process_sampling_config SET identifier_column_default=?, associate_column_default=?, updated_at=? WHERE process_id=?
             """,
-            (payload.identifier_column, payload.associate_column, now, payload.account_id),
+            (payload.identifier_column, payload.associate_column, now, payload.process_id),
         )
         con.execute("UPDATE uploads SET status='USED' WHERE upload_id=?", (upload_id,))
     storage.delete(upload["stored_path"])
@@ -1121,25 +1097,24 @@ def generate_run(upload_id: str, payload: RunIn, user: str = Depends(current_use
 
 
 @app.get("/api/runs")
-def list_runs(account_id: int | None = None, limit: int = 200, user: str = Depends(current_user)):
-    limit = max(1, min(limit, 500))
+def list_runs(account_id: int | None = None, limit: int = 200, user: str = Depends(current_user), process_id: int | None = None):
     with db() as con:
-        if account_id:
-            rows = con.execute(
-                """SELECT r.*, a.name account_name FROM sampling_runs r JOIN accounts a ON a.id=r.account_id
-                   WHERE r.account_id=? ORDER BY r.created_at DESC LIMIT ?""", (account_id, limit)
-            ).fetchall()
-        else:
-            rows = con.execute(
-                """SELECT r.*, a.name account_name FROM sampling_runs r JOIN accounts a ON a.id=r.account_id
-                   ORDER BY r.created_at DESC LIMIT ?""", (limit,)
-            ).fetchall()
+        clause, params = access.scope(con, user, "r.account_id", account_id, process_id)
+        if account_id is not None:
+            clause += " AND r.account_id=?"; params.append(account_id)
+        if process_id is not None:
+            clause += " AND r.process_id=?"; params.append(process_id)
+        params.append(max(1, min(limit, 500)))
+        rows = con.execute(f"""SELECT r.*,a.name account_name,p.name process_name,p.active process_active
+            FROM sampling_runs r JOIN accounts a ON a.id=r.account_id JOIN processes p ON p.id=r.process_id
+            WHERE {clause} ORDER BY r.created_at DESC LIMIT ?""", params).fetchall()
     return [dict(r) for r in rows]
 
 
 @app.get("/api/runs/{rid}")
 def get_run(rid: str, user: str = Depends(current_user)):
     with db() as con:
+        access.record(con, user, "sampling_runs", "run_id", rid, ())
         run = con.execute("SELECT r.*,a.name account_name FROM sampling_runs r JOIN accounts a ON a.id=r.account_id WHERE run_id=?", (rid,)).fetchone()
         if not run:
             raise HTTPException(404, "Run not found")
@@ -1161,6 +1136,7 @@ def get_run(rid: str, user: str = Depends(current_user)):
 def void_run(rid: str, payload: VoidIn, user: str = Depends(current_user)):
     ensure_roles(user, "Administrator", "QA Reviewer")
     with db() as con:
+        access.record(con, user, "sampling_runs", "run_id", rid, ('QA Reviewer',))
         row = con.execute("SELECT status FROM sampling_runs WHERE run_id=?", (rid,)).fetchone()
         if not row:
             raise HTTPException(404, "Run not found")
@@ -1186,6 +1162,9 @@ def inventory(account_id: int | None = None, search: str = "", limit: int = 500,
         params.extend([q, q, q])
     params.append(limit)
     with db() as con:
+        scoped, scope_params = access.scope(con, user, "r.account_id", account_id)
+        where.append(scoped)
+        params[-1:-1] = scope_params
         rows = con.execute(
             f"""
             SELECT sr.identifier_raw identifier, sr.associate, sr.period_key, sr.selection_sequence,

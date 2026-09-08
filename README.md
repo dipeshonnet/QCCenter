@@ -28,11 +28,27 @@ For presentations, an Administrator can open **Admin → System & audit** and en
 
 The built-in roles are Administrator, QA Auditor, QA Reviewer, and Operations Manager. Authorization is enforced by the API, not only by the navigation.
 
+Administrator is global. The other roles are assigned per account in **Admin → Users & roles**; one user may have different roles in different accounts. Lists, record details, sampling, imports, analytics, and exports enforce those account assignments. Users without assignments can sign in but see no account data.
+
+**Admin → Accounts & processes** supports process Archive and Restore. Archiving stops new work and retains history; existing audits and CAPAs can finish. Use **Show archived processes** to restore a process whose parent account is active. Reporting filters continue to include archived history.
+
 Audit cases follow `UNASSIGNED -> ASSIGNED -> IN_PROGRESS -> SUBMITTED -> REVIEWED`. Reviewers can reject a submission back to the auditor; voiding is retained in history. Approved critical findings create a draft CAPA when the process policy enables the automatic trigger.
 
 CAPA stages are Draft, Containment, Root Cause, Action Plan, Implementation, Effectiveness Review, and Closed. Stage changes require the previous stage and append immutable events.
 
 Published scorecard versions are immutable so later template changes cannot alter historical audits.
+
+In **Admin → Scorecards**, select Account, then Process. Admin can edit draft details and items, remove or reorder items, and use **Edit as new version** for existing published or archived scorecards. Publishing the new version applies it to future audits; existing audits keep their original version.
+
+Both panels in **Admin → Process policies** require Account and Process. Sampling coverage quotas, previous-identifier checks, case matching, and remembered column mappings are independent for each process.
+
+## Account-structure upgrade
+
+SQLite applies schema version 3 automatically at startup. PostgreSQL deployments must run `alembic upgrade head` using the migration connection before starting this backend/frontend release; the new revision is `0002_account_structure`. Take the usual database backup before upgrading.
+
+The migration copies each account's sampling controls into its existing processes once. Future processes start with application defaults. Administrator grants and credentials remain intact. Existing global non-Administrator grants are retained as migration reference, but no longer authorize access: Admin must assign accounts to users marked **Account assignment required**. Repeat startups preserve the new grants and settings.
+
+User APIs now expose global `roles` (Administrator only) and `account_roles`, for example `[{"account_id": 1, "roles": ["QA Auditor"]}]`. Sampling configuration uses `GET/PUT /api/admin/processes/{process_id}/sampling-controls`. The former account configuration PUT returns HTTP 410 and points callers to the process endpoint. No automatic grant is made when a new account is created.
 
 ## Six Sigma definitions
 
@@ -79,6 +95,7 @@ From the project folder:
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 .venv\Scripts\python.exe -m py_compile app.py quality.py
 node --check static\app.js
+node --check static\account-admin.js
 ```
 
 See `TEST_REPORT.md` and `design-qa.md` for the latest verification evidence.

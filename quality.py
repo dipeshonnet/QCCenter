@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from app import (
     APP_VERSION,
+    ConfigIn,
     DB_PATH,
     audit,
     current_user,
@@ -29,6 +30,8 @@ from app import (
     password_hash,
 )
 from qcc.database import uses_postgres
+from qcc import access
+from qcc.account_schema import statements, initialize_process, sampling_config
 
 router = APIRouter()
 
@@ -271,7 +274,7 @@ def init_quality_db() -> None:
                 "INSERT OR IGNORE INTO user_profiles(username,display_name,updated_at) VALUES(?,?,?)",
                 (username, username.title(), iso_now()),
             )
-        if users:
+        if users and not con.execute("SELECT 1 FROM schema_migrations WHERE version=2").fetchone():
             con.execute(
                 "INSERT OR IGNORE INTO user_roles(username,role_name) VALUES(?,?)",
                 (users[0]["username"], "Administrator"),
@@ -291,11 +294,16 @@ def init_quality_db() -> None:
                 process_id = existing["id"]
             con.execute("UPDATE sampling_runs SET process_id=? WHERE account_id=? AND process_id IS NULL", (process_id, account["id"]))
         con.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?)", (iso_now(),))
+        if not con.execute("SELECT 1 FROM schema_migrations WHERE version=3").fetchone():
+            for statement in statements():
+                con.execute(statement)
+            con.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)", (iso_now(),))
+
 
 
 def roles_for(username: str) -> list[str]:
     with db() as con:
-        return [r[0] for r in con.execute("SELECT role_name FROM user_roles WHERE username=? ORDER BY role_name", (username,)).fetchall()]
+        return access.roles(con, username)
 
 
 def require_roles(*allowed: str):
@@ -309,7 +317,12 @@ def require_roles(*allowed: str):
 def user_context(user: str) -> dict[str, Any]:
     with db() as con:
         p = con.execute("SELECT display_name,active FROM user_profiles WHERE username=?", (user,)).fetchone()
-    return {"username": user, "display_name": p["display_name"] if p else user, "roles": roles_for(user)}
+        global_roles = ["Administrator"] if access.is_admin(con, user) else []
+        account_roles = access.assignments(con, user)
+    return {"username": user, "display_name": p["display_name"] if p else user,
+            "roles": global_roles, "account_roles": account_roles,
+            "assignment_required": not global_roles and not account_roles}
+
 
 
 def _id(prefix: str) -> str:
@@ -336,11 +349,17 @@ class ProcessSettingsIn(BaseModel):
     capa_due_days: int = Field(default=14, ge=1, le=365)
 
 
+class AccountRoleIn(BaseModel):
+    account_id: int
+    roles: list[str] = Field(min_length=1)
+
+
 class UserIn(BaseModel):
     username: str = Field(min_length=3, max_length=80)
     display_name: str = Field(min_length=1, max_length=120)
     password: str | None = Field(default=None, min_length=8, max_length=200)
-    roles: list[str] = Field(default_factory=lambda: ["QA Auditor"])
+    roles: list[str] = Field(default_factory=list)
+    account_roles: list[AccountRoleIn] = Field(default_factory=list)
     active: bool = True
     must_change_password: bool = True
 
@@ -491,11 +510,13 @@ def _delete_showcase_data(con, state: dict[str, Any]) -> None:
         con.execute(f"DELETE FROM scorecard_versions WHERE id IN ({marks})", scorecard_ids)
     if process_ids:
         marks = ",".join("?" for _ in process_ids)
+        con.execute(f"DELETE FROM process_sampling_config WHERE process_id IN ({marks})", process_ids)
         con.execute(f"DELETE FROM process_settings WHERE process_id IN ({marks})", process_ids)
         con.execute(f"DELETE FROM processes WHERE id IN ({marks})", process_ids)
     if account_id:
         account = con.execute("SELECT name FROM accounts WHERE id=?", (account_id,)).fetchone()
         if account and account["name"] == state.get("account_name"):
+            con.execute("DELETE FROM account_user_roles WHERE account_id=?", (account_id,))
             con.execute("DELETE FROM account_config WHERE account_id=?", (account_id,))
             con.execute("DELETE FROM accounts WHERE id=?", (account_id,))
 
@@ -517,6 +538,7 @@ def _seed_showcase_data(con, user: str) -> dict[str, Any]:
         pid = con.execute("""INSERT INTO processes(account_id,name,process_type,target_yield,target_sigma,active,created_at,updated_at)
                               VALUES(?,?,?,?,3.5,1,?,?)""", (account_id, name, process_type, target_yield, now_text, now_text)).lastrowid
         process_ids.append(pid)
+        initialize_process(con, pid, now_text)
         con.execute("""INSERT INTO process_settings(process_id,sampling_frequency,sampling_count,assignment_mode,subgroup_mode,
                        baseline_subgroups,critical_capa_enabled,capa_due_days,updated_at) VALUES(?,'weekly',25,'round_robin','day',20,1,7,?)""",
                     (pid, now_text))
@@ -671,16 +693,32 @@ def admin_users(user: str = Depends(require_roles("Administrator"))):
             """SELECT u.username,p.display_name,p.active,p.must_change_password,u.created_at
                FROM users u JOIN user_profiles p ON p.username=u.username ORDER BY p.display_name COLLATE NOCASE"""
         ).fetchall()
-        return [dict(r) | {"roles": [x[0] for x in con.execute("SELECT role_name FROM user_roles WHERE username=? ORDER BY role_name", (r["username"],)).fetchall()]} for r in rows]
+        users = []
+        for r in rows:
+            grants = access.assignments(con, r["username"])
+            global_roles = ["Administrator"] if access.is_admin(con, r["username"]) else []
+            users.append(dict(r) | {"roles": global_roles, "account_roles": grants,
+                "assignment_required": not global_roles and not grants,
+                "legacy_roles": [x[0] for x in con.execute("SELECT role_name FROM legacy_user_roles WHERE username=?", (r["username"],)).fetchall()]})
+        return users
 
 
 @router.post("/api/admin/users")
 def save_admin_user(payload: UserIn, user: str = Depends(require_roles("Administrator"))):
-    invalid = set(payload.roles) - set(ROLES)
+    invalid = set(payload.roles) - {"Administrator"}
     if invalid:
         raise HTTPException(400, f"Unknown roles: {', '.join(sorted(invalid))}")
     username = re.sub(r"\s+", "", payload.username.strip()).casefold()
     with db() as con:
+        for grant in payload.account_roles:
+            if set(grant.roles) - access.ACCOUNT_ROLES:
+                raise HTTPException(400, "Account roles must be QA Auditor, QA Reviewer, or Operations Manager")
+            if not con.execute("SELECT 1 FROM accounts WHERE id=?", (grant.account_id,)).fetchone():
+                raise HTTPException(400, "Account not found")
+        if access.is_admin(con, username) and (not payload.active or "Administrator" not in payload.roles):
+            remaining = con.execute("SELECT COUNT(*) FROM user_roles r JOIN user_profiles p ON p.username=r.username WHERE r.role_name='Administrator' AND p.active=1 AND r.username<>?", (username,)).fetchone()[0]
+            if not remaining:
+                raise HTTPException(409, "Keep at least one active Administrator")
         exists = con.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone()
         if not exists:
             if not payload.password:
@@ -697,22 +735,29 @@ def save_admin_user(payload: UserIn, user: str = Depends(require_roles("Administ
             (username, payload.display_name.strip(), int(payload.active), int(payload.must_change_password), iso_now()),
         )
         con.execute("DELETE FROM user_roles WHERE username=?", (username,))
-        for role in payload.roles:
+        for role in set(payload.roles):
             con.execute("INSERT INTO user_roles(username,role_name) VALUES(?,?)", (username, role))
-    audit("USER_CONFIGURED", user, "user", username, {"roles": payload.roles, "active": payload.active})
+        con.execute("DELETE FROM account_user_roles WHERE username=?", (username,))
+        for aid, role in {(g.account_id, r) for g in payload.account_roles for r in g.roles}:
+            con.execute("INSERT INTO account_user_roles(username,account_id,role_name) VALUES(?,?,?)", (username, aid, role))
+
+    audit("USER_CONFIGURED", user, "user", username, {"roles": payload.roles, "account_roles": [g.model_dump() for g in payload.account_roles], "active": payload.active})
     return {"ok": True, "username": username}
 
 
 @router.get("/api/admin/processes")
-def list_processes(account_id: int | None = None, user: str = Depends(current_user)):
+def list_processes(account_id: int | None = None, user: str = Depends(current_user), include_archived: bool = False):
     params: list[Any] = []
-    where = "WHERE p.active=1"
+    where = "WHERE 1=1" if include_archived else "WHERE p.active=1 AND a.active=1"
     if account_id:
         where += " AND p.account_id=?"
         params.append(account_id)
     with db() as con:
+        clause, scope_params = access.scope(con, user, "p.account_id", account_id)
+        where += " AND " + clause
+        params += scope_params
         rows = con.execute(
-            f"""SELECT p.*,a.name account_name,ps.sampling_frequency,ps.sampling_count,ps.assignment_mode,
+            f"""SELECT p.*,a.active account_active,a.name account_name,ps.sampling_frequency,ps.sampling_count,ps.assignment_mode,
                        ps.subgroup_mode,ps.baseline_subgroups,ps.critical_capa_enabled,ps.capa_due_days,
                        ps.import_mapping_json
                 FROM processes p JOIN accounts a ON a.id=p.account_id
@@ -720,7 +765,7 @@ def list_processes(account_id: int | None = None, user: str = Depends(current_us
                 ORDER BY a.name COLLATE NOCASE,p.name COLLATE NOCASE""",
             params,
         ).fetchall()
-    return [dict(r) for r in rows]
+        return [dict(r) | {"sampling_config": sampling_config(con, r["id"])} for r in rows]
 
 
 @router.post("/api/admin/processes")
@@ -739,6 +784,7 @@ def create_process(payload: ProcessIn, user: str = Depends(require_roles("Admini
             )
             pid = cur.lastrowid
             con.execute("INSERT INTO process_settings(process_id,updated_at) VALUES(?,?)", (pid, now))
+            initialize_process(con, pid, now)
     except HTTPException:
         raise
     except Exception as exc:
@@ -752,8 +798,14 @@ def update_process(process_id: int, payload: ProcessIn, user: str = Depends(requ
     if payload.process_type not in {"front_office", "back_office"}:
         raise HTTPException(400, "Invalid process type")
     with db() as con:
+        access.process(con, user, process_id, active=True)
         if not con.execute("SELECT 1 FROM processes WHERE id=?", (process_id,)).fetchone():
             raise HTTPException(404, "Process not found")
+        current = access.process(con, user, process_id)
+        if current["account_id"] != payload.account_id:
+            raise HTTPException(409, "A process cannot be moved to another account")
+        if bool(current["active"]) != payload.active:
+            raise HTTPException(409, "Use the archive or restore action")
         con.execute(
             """UPDATE processes SET account_id=?,name=?,process_type=?,timezone=?,target_yield=?,target_sigma=?,active=?,updated_at=? WHERE id=?""",
             (payload.account_id, payload.name.strip(), payload.process_type, payload.timezone, payload.target_yield, payload.target_sigma, int(payload.active), iso_now(), process_id),
@@ -767,6 +819,7 @@ def update_process_settings(process_id: int, payload: ProcessSettingsIn, user: s
     if payload.sampling_frequency not in {"daily", "weekly", "monthly", "manual"} or payload.subgroup_mode not in {"day", "week", "month"}:
         raise HTTPException(400, "Invalid frequency or subgroup mode")
     with db() as con:
+        access.process(con, user, process_id, active=True)
         if not con.execute("SELECT 1 FROM processes WHERE id=?", (process_id,)).fetchone():
             raise HTTPException(404, "Process not found")
         con.execute(
@@ -784,13 +837,19 @@ def update_process_settings(process_id: int, payload: ProcessSettingsIn, user: s
 
 
 @router.get("/api/scorecards")
-def list_scorecards(process_id: int | None = None, user: str = Depends(current_user)):
+def list_scorecards(process_id: int | None = None, user: str = Depends(current_user), account_id: int | None = None):
     where, params = "", []
     if process_id:
         where, params = "WHERE s.process_id=?", [process_id]
     with db() as con:
+        clause, scoped = access.scope(con, user, "p.account_id", account_id, process_id)
+        where = (where + " AND " if where else "WHERE ") + clause
+        params += scoped
+        if account_id is not None:
+            where += " AND p.account_id=?"
+            params.append(account_id)
         cards = [dict(r) for r in con.execute(
-            f"""SELECT s.*,p.name process_name,p.process_type,a.name account_name,
+            f"""SELECT s.*,p.account_id,p.active process_active,a.active account_active,p.name process_name,p.process_type,a.name account_name,
                         (SELECT COUNT(*) FROM scorecard_items i WHERE i.scorecard_version_id=s.id AND i.active=1) item_count
                  FROM scorecard_versions s JOIN processes p ON p.id=s.process_id JOIN accounts a ON a.id=p.account_id
                  {where} ORDER BY a.name,p.name,s.version DESC""", params).fetchall()]
@@ -802,6 +861,8 @@ def list_scorecards(process_id: int | None = None, user: str = Depends(current_u
 @router.post("/api/admin/scorecards")
 def create_scorecard(payload: ScorecardIn, user: str = Depends(require_roles("Administrator"))):
     with db() as con:
+        lock_scorecard_process(con, payload.process_id)
+        access.process(con, user, payload.process_id, active=True)
         if not con.execute("SELECT 1 FROM processes WHERE id=?", (payload.process_id,)).fetchone():
             raise HTTPException(404, "Process not found")
         version = con.execute("SELECT COALESCE(MAX(version),0)+1 FROM scorecard_versions WHERE process_id=?", (payload.process_id,)).fetchone()[0]
@@ -821,11 +882,7 @@ def add_scorecard_item(scorecard_id: int, payload: ScorecardItemIn, user: str = 
     if payload.item_type not in {"question", "defect", "sla"}:
         raise HTTPException(400, "Invalid item type")
     with db() as con:
-        card = con.execute("SELECT status FROM scorecard_versions WHERE id=?", (scorecard_id,)).fetchone()
-        if not card:
-            raise HTTPException(404, "Scorecard not found")
-        if card["status"] != "DRAFT":
-            raise HTTPException(409, "Published scorecards are immutable; create a new version")
+        editable_scorecard(con, user, scorecard_id)
         cur = con.execute(
             """INSERT INTO scorecard_items(scorecard_version_id,item_type,category,name,weight,severity,critical,
                opportunity_count,target,lsl,usl,unit,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -839,11 +896,7 @@ def add_scorecard_item(scorecard_id: int, payload: ScorecardItemIn, user: str = 
 @router.post("/api/admin/scorecards/{scorecard_id}/publish")
 def publish_scorecard(scorecard_id: int, user: str = Depends(require_roles("Administrator"))):
     with db() as con:
-        card = con.execute("SELECT * FROM scorecard_versions WHERE id=?", (scorecard_id,)).fetchone()
-        if not card:
-            raise HTTPException(404, "Scorecard not found")
-        if card["status"] != "DRAFT":
-            raise HTTPException(409, "Scorecard is not a draft")
+        card = editable_scorecard(con, user, scorecard_id)
         items = con.execute("SELECT item_type,weight FROM scorecard_items WHERE scorecard_version_id=? AND active=1", (scorecard_id,)).fetchall()
         if not items:
             raise HTTPException(400, "Add at least one scorecard item before publishing")
@@ -880,8 +933,11 @@ def list_audits(process_id: int | None = None, status: str | None = None, assign
     sql_where += extra; params += date_params
     params.append(max(1, min(limit, 1000)))
     with db() as con:
+        clause, scoped = access.scope(con, user, "p.account_id", account_id, process_id)
+        sql_where += " AND " + clause
+        params[-1:-1] = scoped
         rows = con.execute(
-            f"""SELECT c.*,p.name process_name,p.process_type,a.name account_name,s.name scorecard_name,s.version scorecard_version
+            f"""SELECT c.*,p.account_id,p.active process_active,p.name process_name,p.process_type,a.name account_name,s.name scorecard_name,s.version scorecard_version
                  FROM audit_cases c JOIN processes p ON p.id=c.process_id JOIN accounts a ON a.id=p.account_id
                  LEFT JOIN scorecard_versions s ON s.id=c.scorecard_version_id {sql_where}
                  ORDER BY CASE c.status WHEN 'SUBMITTED' THEN 0 WHEN 'IN_PROGRESS' THEN 1 WHEN 'ASSIGNED' THEN 2 ELSE 3 END,
@@ -892,8 +948,9 @@ def list_audits(process_id: int | None = None, status: str | None = None, assign
 @router.get("/api/audits/{audit_id}")
 def get_audit(audit_id: str, user: str = Depends(current_user)):
     with db() as con:
+        access.record(con, user, "audit_cases", "audit_id", audit_id, ())
         row = con.execute(
-            """SELECT c.*,p.name process_name,p.process_type,a.name account_name,s.name scorecard_name,s.version scorecard_version,
+            """SELECT c.*,p.account_id,p.active process_active,p.name process_name,p.process_type,a.name account_name,s.name scorecard_name,s.version scorecard_version,
                       s.passing_score,s.opportunities_per_unit,s.critical_fail_override
                FROM audit_cases c JOIN processes p ON p.id=c.process_id JOIN accounts a ON a.id=p.account_id
                LEFT JOIN scorecard_versions s ON s.id=c.scorecard_version_id WHERE c.audit_id=?""", (audit_id,)).fetchone()
@@ -943,6 +1000,7 @@ def _score_audit(con, audit, responses: list[AuditResponseIn], defect_ids: list[
 @router.put("/api/audits/{audit_id}")
 def save_audit(audit_id: str, payload: AuditSaveIn, user: str = Depends(require_roles("Administrator", "QA Auditor"))):
     with db() as con:
+        access.record(con, user, "audit_cases", "audit_id", audit_id, ('QA Auditor',))
         case = con.execute("SELECT * FROM audit_cases WHERE audit_id=?", (audit_id,)).fetchone()
         if not case:
             raise HTTPException(404, "Audit not found")
@@ -950,6 +1008,11 @@ def save_audit(audit_id: str, payload: AuditSaveIn, user: str = Depends(require_
             raise HTTPException(409, "This audit can no longer be edited")
         if not case["scorecard_version_id"]:
             raise HTTPException(400, "Assign a published scorecard before scoring")
+        proc = access.process(con, user, case["process_id"], ("QA Auditor",))
+        access.validate_assignee(con, payload.assigned_to, proc["account_id"], ("QA Auditor",))
+        valid_items = {r[0] for r in con.execute("SELECT id FROM scorecard_items WHERE scorecard_version_id=? AND active=1", (case["scorecard_version_id"],)).fetchall()}
+        if ({r.item_id for r in payload.responses} | set(payload.defect_item_ids)) - valid_items:
+            raise HTTPException(400, "Items must belong to this audit's scorecard")
         score = _score_audit(con, case, payload.responses, payload.defect_item_ids)
         con.execute("DELETE FROM audit_responses WHERE audit_id=?", (audit_id,))
         for r in payload.responses:
@@ -972,6 +1035,7 @@ def save_audit(audit_id: str, payload: AuditSaveIn, user: str = Depends(require_
 @router.post("/api/audits/{audit_id}/submit")
 def submit_audit(audit_id: str, user: str = Depends(require_roles("Administrator", "QA Auditor"))):
     with db() as con:
+        access.record(con, user, "audit_cases", "audit_id", audit_id, ('QA Auditor',))
         row = con.execute("SELECT status,weighted_score FROM audit_cases WHERE audit_id=?", (audit_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Audit not found")
@@ -998,6 +1062,7 @@ def review_audit(audit_id: str, payload: ReviewIn, user: str = Depends(require_r
         raise HTTPException(400, "Decision must be APPROVE or REJECT")
     capa_id = None
     with db() as con:
+        access.record(con, user, "audit_cases", "audit_id", audit_id, ('QA Reviewer', 'Operations Manager'))
         row = con.execute("SELECT * FROM audit_cases WHERE audit_id=?", (audit_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Audit not found")
@@ -1078,6 +1143,13 @@ def commit_result_import(import_id: str, payload: ImportCommitIn, user: str = De
         raise HTTPException(400, "Map case ID, audit date, and opportunities")
     committed, errors = 0, []
     with db() as con:
+        access.staging(con, user, "result_imports", "import_id", import_id)
+        lock_scorecard_process(con, payload.process_id)
+        access.process(con, user, payload.process_id, ("QA Reviewer",), active=True)
+        if payload.scorecard_version_id is not None:
+            card = con.execute("SELECT process_id FROM scorecard_versions WHERE id=?", (payload.scorecard_version_id,)).fetchone()
+            if not card or card["process_id"] != payload.process_id:
+                raise HTTPException(400, "Scorecard does not belong to this process")
         imp = con.execute("SELECT * FROM result_imports WHERE import_id=?", (import_id,)).fetchone()
         if not imp:
             raise HTTPException(404, "Import not found")
@@ -1155,6 +1227,7 @@ def commit_result_import(import_id: str, payload: ImportCommitIn, user: str = De
 @router.get("/api/results/imports/{import_id}/errors")
 def import_errors(import_id: str, user: str = Depends(current_user)):
     with db() as con:
+        access.staging(con, user, "result_imports", "import_id", import_id)
         rows = con.execute("SELECT row_number,row_json,error FROM result_import_rows WHERE import_id=? AND status='ERROR' ORDER BY row_number", (import_id,)).fetchall()
     out = io.StringIO(newline="")
     writer = csv.writer(out)
@@ -1200,7 +1273,7 @@ def _sigma_level(dpmo: float) -> float:
     return max(0.0, min(6.0, NormalDist().inv_cdf(yield_rate) + 1.5))
 
 
-def analytics_payload(account_id: int | None, process_id: int | None, date_from: str | None, date_to: str | None) -> dict[str, Any]:
+def analytics_payload(account_id: int | None, process_id: int | None, date_from: str | None, date_to: str | None, user: str = "admin") -> dict[str, Any]:
     where = ["c.status='REVIEWED'"]
     params: list[Any] = []
     if account_id:
@@ -1211,8 +1284,11 @@ def analytics_payload(account_id: int | None, process_id: int | None, date_from:
     sql_where = " AND ".join(where) + extra
     params += date_params
     with db() as con:
+        clause, scoped = access.scope(con, user, "p.account_id", account_id, process_id)
+        sql_where += " AND " + clause
+        params += scoped
         cases = [dict(r) for r in con.execute(
-            f"""SELECT c.*,p.name process_name,p.process_type,a.name account_name
+            f"""SELECT c.*,p.account_id,p.active process_active,p.name process_name,p.process_type,a.name account_name
                  FROM audit_cases c JOIN processes p ON p.id=c.process_id JOIN accounts a ON a.id=p.account_id
                  WHERE {sql_where} ORDER BY COALESCE(c.reviewed_at,c.submitted_at)""", params).fetchall()]
         audit_ids = [c["audit_id"] for c in cases]
@@ -1225,7 +1301,10 @@ def analytics_payload(account_id: int | None, process_id: int | None, date_from:
             capa_where.append("process_id=?"); capa_params.append(process_id)
         elif account_id:
             capa_where.append("process_id IN (SELECT id FROM processes WHERE account_id=?)"); capa_params.append(account_id)
-        sql_capa = "WHERE " + " AND ".join(capa_where) if capa_where else ""
+        capa_scope, scoped = access.scope(con, user, "account_id")
+        capa_where.append("process_id IN (SELECT id FROM processes WHERE " + capa_scope + ")")
+        capa_params += scoped
+        sql_capa = "WHERE " + " AND ".join(capa_where)
         capas = [dict(r) for r in con.execute(f"SELECT * FROM capas {sql_capa} ORDER BY CASE priority WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 ELSE 2 END,due_date LIMIT 12", capa_params).fetchall()]
     units = len(cases)
     defect_count = sum(int(c["defect_count"] or 0) for c in cases)
@@ -1270,13 +1349,13 @@ def analytics_payload(account_id: int | None, process_id: int | None, date_from:
 @router.get("/api/analytics/summary")
 def analytics_summary(account_id: int | None = None, process_id: int | None = None, date_from: str | None = None,
                       date_to: str | None = None, user: str = Depends(current_user)):
-    return analytics_payload(account_id, process_id, date_from, date_to)
+    return analytics_payload(account_id, process_id, date_from, date_to, user)
 
 
 @router.get("/api/analytics/control-chart")
 def analytics_control_chart(chart_type: str = "p", account_id: int | None = None, process_id: int | None = None,
                             date_from: str | None = None, date_to: str | None = None, user: str = Depends(current_user)):
-    data = analytics_payload(account_id, process_id, date_from, date_to)
+    data = analytics_payload(account_id, process_id, date_from, date_to, user)
     if chart_type not in {"p", "u"}:
         raise HTTPException(400, "Chart type must be p or u")
     return {"chart_type": chart_type, "stability": data["stability"], "points": data["control_chart"]}
@@ -1285,13 +1364,14 @@ def analytics_control_chart(chart_type: str = "p", account_id: int | None = None
 @router.get("/api/analytics/pareto")
 def analytics_pareto(account_id: int | None = None, process_id: int | None = None, date_from: str | None = None,
                      date_to: str | None = None, user: str = Depends(current_user)):
-    return analytics_payload(account_id, process_id, date_from, date_to)["pareto"]
+    return analytics_payload(account_id, process_id, date_from, date_to, user)["pareto"]
 
 
 @router.get("/api/analytics/capability")
 def analytics_capability(process_id: int, item_id: int, user: str = Depends(current_user)):
     with db() as con:
-        item = con.execute("SELECT * FROM scorecard_items WHERE id=? AND item_type='sla'", (item_id,)).fetchone()
+        access.process(con, user, process_id)
+        item = con.execute("SELECT * FROM scorecard_items WHERE id=? AND item_type='sla' AND scorecard_version_id IN (SELECT id FROM scorecard_versions WHERE process_id=?)", (item_id, process_id)).fetchone()
         if not item:
             raise HTTPException(404, "SLA item not found")
         values = [float(r[0]) for r in con.execute(
@@ -1327,7 +1407,10 @@ def list_capas(process_id: int | None = None, stage: str | None = None, user: st
     sql_where = "WHERE " + " AND ".join(where) if where else "WHERE 1=1"
     sql_where += extra; params += date_params
     with db() as con:
-        rows = con.execute(f"""SELECT c.*,p.name process_name,a.name account_name
+        clause, scoped = access.scope(con, user, "p.account_id", account_id, process_id)
+        sql_where += " AND " + clause
+        params += scoped
+        rows = con.execute(f"""SELECT c.*,p.account_id,p.active process_active,p.name process_name,a.name account_name
             FROM capas c JOIN processes p ON p.id=c.process_id JOIN accounts a ON a.id=p.account_id
             {sql_where} ORDER BY CASE c.priority WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,c.due_date""", params).fetchall()
     return [dict(r) for r in rows]
@@ -1336,8 +1419,15 @@ def list_capas(process_id: int | None = None, stage: str | None = None, user: st
 @router.post("/api/capas")
 def create_capa(payload: CapaIn, user: str = Depends(require_roles("Administrator", "QA Reviewer", "Operations Manager"))):
     with db() as con:
+        access.process(con, user, payload.process_id, active=True)
         if not con.execute("SELECT 1 FROM processes WHERE id=?", (payload.process_id,)).fetchone():
             raise HTTPException(404, "Process not found")
+        proc = access.process(con, user, payload.process_id, ("QA Reviewer", "Operations Manager"), active=True)
+        access.validate_assignee(con, payload.owner, proc["account_id"], ("QA Reviewer", "Operations Manager"))
+        if payload.audit_id:
+            case = access.record(con, user, "audit_cases", "audit_id", payload.audit_id)
+            if case["process_id"] != payload.process_id:
+                raise HTTPException(400, "Audit does not belong to this process")
         cid = _create_capa(con, payload.process_id, payload.audit_id, payload.title.strip(), payload.priority.upper(), payload.owner, payload.due_date, user)
     audit("CAPA_CREATED", user, "capa", cid)
     return {"capa_id": cid, "ok": True}
@@ -1346,7 +1436,8 @@ def create_capa(payload: CapaIn, user: str = Depends(require_roles("Administrato
 @router.get("/api/capas/{capa_id}")
 def get_capa(capa_id: str, user: str = Depends(current_user)):
     with db() as con:
-        row = con.execute("SELECT c.*,p.name process_name,a.name account_name FROM capas c JOIN processes p ON p.id=c.process_id JOIN accounts a ON a.id=p.account_id WHERE capa_id=?", (capa_id,)).fetchone()
+        access.record(con, user, "capas", "capa_id", capa_id, ())
+        row = con.execute("SELECT c.*,p.account_id,p.active process_active,p.name process_name,a.name account_name FROM capas c JOIN processes p ON p.id=c.process_id JOIN accounts a ON a.id=p.account_id WHERE capa_id=?", (capa_id,)).fetchone()
         if not row: raise HTTPException(404, "CAPA not found")
         out = dict(row)
         out["events"] = [dict(x) for x in con.execute("SELECT * FROM capa_events WHERE capa_id=? ORDER BY created_at", (capa_id,)).fetchall()]
@@ -1356,7 +1447,12 @@ def get_capa(capa_id: str, user: str = Depends(current_user)):
 @router.put("/api/capas/{capa_id}")
 def update_capa(capa_id: str, payload: CapaUpdateIn, user: str = Depends(require_roles("Administrator", "QA Reviewer", "Operations Manager"))):
     with db() as con:
+        access.record(con, user, "capas", "capa_id", capa_id, ('QA Reviewer', 'Operations Manager'))
         if not con.execute("SELECT 1 FROM capas WHERE capa_id=?", (capa_id,)).fetchone(): raise HTTPException(404, "CAPA not found")
+        capa = access.record(con, user, "capas", "capa_id", capa_id)
+        proc = access.process(con, user, capa["process_id"])
+        if payload.owner != capa["owner"]:
+            access.validate_assignee(con, payload.owner, proc["account_id"], ("QA Reviewer", "Operations Manager"))
         con.execute("""UPDATE capas SET owner=?,due_date=?,containment=?,root_cause=?,action_plan=?,implementation_notes=?,
                        effectiveness=?,updated_at=? WHERE capa_id=?""",
                     (payload.owner,payload.due_date,payload.containment,payload.root_cause,payload.action_plan,
@@ -1372,6 +1468,7 @@ def transition_capa(capa_id: str, payload: TransitionIn, user: str = Depends(req
     target = payload.to_stage.upper()
     if target not in CAPA_STAGES: raise HTTPException(400, "Invalid CAPA stage")
     with db() as con:
+        access.record(con, user, "capas", "capa_id", capa_id, ('QA Reviewer', 'Operations Manager'))
         row = con.execute("SELECT stage,root_cause,action_plan,effectiveness FROM capas WHERE capa_id=?", (capa_id,)).fetchone()
         if not row: raise HTTPException(404, "CAPA not found")
         current = row["stage"]
@@ -1391,7 +1488,7 @@ def transition_capa(capa_id: str, payload: TransitionIn, user: str = Depends(req
 @router.get("/api/reports/quality.xlsx")
 def quality_report(account_id: int | None = None, process_id: int | None = None, date_from: str | None = None,
                    date_to: str | None = None, user: str = Depends(current_user)):
-    data = analytics_payload(account_id, process_id, date_from, date_to)
+    data = analytics_payload(account_id, process_id, date_from, date_to, user)
     audits = list_audits(process_id=process_id, limit=1000, user=user, account_id=account_id, date_from=date_from, date_to=date_to)
     capas = list_capas(process_id=process_id, user=user, account_id=account_id, date_from=date_from, date_to=date_to)
     wb = Workbook(); summary = wb.active; summary.title = "Quality Summary"
@@ -1416,6 +1513,158 @@ def quality_report(account_id: int | None = None, process_id: int | None = None,
                                                               "date_from": date_from, "date_to": date_to})
     return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                              headers={"Content-Disposition": 'attachment; filename="Quality_Command_Center_Report.xlsx"'})
+
+
+def lock_scorecard_process(con, process_id):
+    # Both SQLite and PostgreSQL serialize writers to this process before MAX(version).
+    con.execute("UPDATE processes SET updated_at=updated_at WHERE id=?", (process_id,))
+
+
+@router.post("/api/admin/processes/{process_id}/archive")
+def archive_process(process_id: int, user: str = Depends(require_roles("Administrator"))):
+    with db() as con:
+        access.require(con, user, allowed=("Administrator",))
+        access.process(con, user, process_id)
+        con.execute("UPDATE processes SET active=0,updated_at=? WHERE id=?", (iso_now(), process_id))
+    audit("PROCESS_ARCHIVED", user, "process", str(process_id))
+    return {"ok": True}
+
+
+@router.post("/api/admin/processes/{process_id}/restore")
+def restore_process(process_id: int, user: str = Depends(require_roles("Administrator"))):
+    with db() as con:
+        access.require(con, user, allowed=("Administrator",))
+        proc = access.process(con, user, process_id)
+        if not proc["account_active"]:
+            raise HTTPException(409, "Restore requires an active parent account")
+        con.execute("UPDATE processes SET active=1,updated_at=? WHERE id=?", (iso_now(), process_id))
+    audit("PROCESS_RESTORED", user, "process", str(process_id))
+    return {"ok": True}
+
+
+@router.get("/api/admin/processes/{process_id}/sampling-controls")
+def get_sampling_controls(process_id: int, user: str = Depends(current_user)):
+    with db() as con:
+        access.process(con, user, process_id)
+        return sampling_config(con, process_id)
+
+
+@router.put("/api/admin/processes/{process_id}/sampling-controls")
+def save_sampling_controls(process_id: int, payload: ConfigIn, user: str = Depends(require_roles("Administrator"))):
+    if payload.coverage_period not in {"day", "week", "month"}:
+        raise HTTPException(400, "Coverage period must be day, week, or month")
+    with db() as con:
+        access.require(con, user, allowed=("Administrator",))
+        access.process(con, user, process_id, active=True)
+        initialize_process(con, process_id, iso_now())
+        before = sampling_config(con, process_id)
+        values = payload.model_dump()
+        con.execute("""UPDATE process_sampling_config SET coverage_enabled=?,coverage_period=?,audits_per_associate=?,
+            identifier_column_default=?,associate_column_default=?,exclude_previously_sampled=?,case_insensitive_ids=?,updated_at=? WHERE process_id=?""",
+            (int(payload.coverage_enabled), payload.coverage_period, payload.audits_per_associate,
+             payload.identifier_column_default, payload.associate_column_default, int(payload.exclude_previously_sampled),
+             int(payload.case_insensitive_ids), iso_now(), process_id))
+    audit("PROCESS_SAMPLING_CONTROLS_CHANGED", user, "process", str(process_id), {"before": before, "after": values})
+    return {"ok": True}
+
+
+@router.get("/api/accounts/{account_id}/assignees")
+def account_assignees(account_id: int, role: str = "QA Auditor", user: str = Depends(current_user)):
+    if role not in access.ACCOUNT_ROLES:
+        raise HTTPException(400, "Unknown account role")
+    with db() as con:
+        access.require(con, user, account_id)
+        return [dict(r) for r in con.execute("""SELECT p.username,p.display_name FROM user_profiles p WHERE p.active=1 AND
+            (EXISTS(SELECT 1 FROM user_roles r WHERE r.username=p.username AND r.role_name='Administrator') OR
+             EXISTS(SELECT 1 FROM account_user_roles r WHERE r.username=p.username AND r.account_id=? AND r.role_name=?))
+             ORDER BY p.display_name""", (account_id, role)).fetchall()]
+
+
+def editable_scorecard(con, user, scorecard_id):
+    access.require(con, user, allowed=("Administrator",))
+    card = access.record(con, user, "scorecard_versions", "id", scorecard_id)
+    lock_scorecard_process(con, card["process_id"])
+    access.process(con, user, card["process_id"], active=True)
+    # Read status again after obtaining the writer lock.
+    card = con.execute("SELECT * FROM scorecard_versions WHERE id=?", (scorecard_id,)).fetchone()
+    if card["status"] != "DRAFT":
+        raise HTTPException(409, "Published scorecards are immutable; edit as a new version")
+    return card
+
+
+@router.post("/api/admin/scorecards/{scorecard_id}/clone")
+def clone_scorecard(scorecard_id: int, user: str = Depends(require_roles("Administrator"))):
+    with db() as con:
+        access.require(con, user, allowed=("Administrator",))
+        card = access.record(con, user, "scorecard_versions", "id", scorecard_id)
+        lock_scorecard_process(con, card["process_id"])
+        access.process(con, user, card["process_id"], active=True)
+        version = con.execute("SELECT COALESCE(MAX(version),0)+1 FROM scorecard_versions WHERE process_id=?", (card["process_id"],)).fetchone()[0]
+        sid = con.execute("""INSERT INTO scorecard_versions(process_id,name,version,passing_score,opportunities_per_unit,
+            critical_fail_override,created_at,created_by) VALUES(?,?,?,?,?,?,?,?)""",
+            (card["process_id"], card["name"], version, card["passing_score"], card["opportunities_per_unit"], card["critical_fail_override"], iso_now(), user)).lastrowid
+        con.execute("""INSERT INTO scorecard_items(scorecard_version_id,item_type,category,name,weight,severity,critical,
+            opportunity_count,target,lsl,usl,unit,sort_order)
+            SELECT ?,item_type,category,name,weight,severity,critical,opportunity_count,target,lsl,usl,unit,sort_order
+            FROM scorecard_items WHERE scorecard_version_id=? AND active=1""", (sid, scorecard_id))
+    audit("SCORECARD_CLONED", user, "scorecard", str(sid), {"source_id": scorecard_id, "version": version})
+    return {"ok": True, "id": sid, "version": version}
+
+
+@router.put("/api/admin/scorecards/{scorecard_id}")
+def update_scorecard(scorecard_id: int, payload: ScorecardIn, user: str = Depends(require_roles("Administrator"))):
+    with db() as con:
+        card = editable_scorecard(con, user, scorecard_id)
+        if card["process_id"] != payload.process_id:
+            raise HTTPException(409, "A scorecard cannot be moved to another process")
+        con.execute("""UPDATE scorecard_versions SET name=?,passing_score=?,opportunities_per_unit=?,critical_fail_override=? WHERE id=?""",
+            (payload.name.strip(), payload.passing_score, payload.opportunities_per_unit, int(payload.critical_fail_override), scorecard_id))
+    audit("SCORECARD_UPDATED", user, "scorecard", str(scorecard_id), payload.model_dump())
+    return {"ok": True}
+
+
+@router.put("/api/admin/scorecards/{scorecard_id}/items/{item_id}")
+def update_scorecard_item(scorecard_id: int, item_id: int, payload: ScorecardItemIn, user: str = Depends(require_roles("Administrator"))):
+    if payload.item_type not in {"question", "defect", "sla"}:
+        raise HTTPException(400, "Invalid item type")
+    with db() as con:
+        editable_scorecard(con, user, scorecard_id)
+        if not con.execute("SELECT 1 FROM scorecard_items WHERE id=? AND scorecard_version_id=? AND active=1", (item_id, scorecard_id)).fetchone():
+            raise HTTPException(404, "Scorecard item not found")
+        con.execute("""UPDATE scorecard_items SET item_type=?,category=?,name=?,weight=?,severity=?,critical=?,
+            opportunity_count=?,target=?,lsl=?,usl=?,unit=?,sort_order=? WHERE id=? AND scorecard_version_id=?""",
+            (payload.item_type, payload.category.strip(), payload.name.strip(), payload.weight, payload.severity, int(payload.critical),
+             payload.opportunity_count, payload.target, payload.lsl, payload.usl, payload.unit, payload.sort_order, item_id, scorecard_id))
+    audit("SCORECARD_ITEM_UPDATED", user, "scorecard", str(scorecard_id), {"item_id": item_id})
+    return {"ok": True}
+
+
+@router.delete("/api/admin/scorecards/{scorecard_id}/items/{item_id}")
+def delete_scorecard_item(scorecard_id: int, item_id: int, user: str = Depends(require_roles("Administrator"))):
+    with db() as con:
+        editable_scorecard(con, user, scorecard_id)
+        if not con.execute("SELECT 1 FROM scorecard_items WHERE id=? AND scorecard_version_id=? AND active=1", (item_id, scorecard_id)).fetchone():
+            raise HTTPException(404, "Scorecard item not found")
+        con.execute("UPDATE scorecard_items SET active=0 WHERE id=? AND scorecard_version_id=?", (item_id, scorecard_id))
+    audit("SCORECARD_ITEM_REMOVED", user, "scorecard", str(scorecard_id), {"item_id": item_id})
+    return {"ok": True}
+
+
+class ScorecardOrderIn(BaseModel):
+    item_ids: list[int]
+
+
+@router.put("/api/admin/scorecards/{scorecard_id}/reorder")
+def reorder_scorecard(scorecard_id: int, payload: ScorecardOrderIn, user: str = Depends(require_roles("Administrator"))):
+    with db() as con:
+        editable_scorecard(con, user, scorecard_id)
+        ids = {r[0] for r in con.execute("SELECT id FROM scorecard_items WHERE scorecard_version_id=? AND active=1", (scorecard_id,)).fetchall()}
+        if set(payload.item_ids) != ids or len(payload.item_ids) != len(ids):
+            raise HTTPException(400, "Include every active item exactly once")
+        for order, item_id in enumerate(payload.item_ids, 1):
+            con.execute("UPDATE scorecard_items SET sort_order=? WHERE id=? AND scorecard_version_id=?", (order, item_id, scorecard_id))
+    audit("SCORECARD_ITEMS_REORDERED", user, "scorecard", str(scorecard_id))
+    return {"ok": True}
 
 
 init_quality_db()

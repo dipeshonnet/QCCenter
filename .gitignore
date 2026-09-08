@@ -15,4 +15,5 @@ logs/*.log
 .playwright-cli/
 .netlify/
 .npm-cache/
+output/
 quality-command-center-site/

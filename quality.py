@@ -570,7 +570,7 @@ def _seed_showcase_data(con, user: str) -> dict[str, Any]:
                            opportunities,defect_count,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (aid, back_pid, f"SHOW-B-{day_index:02d}-{unit:02d}", back_card, "REVIEWED", "demo.auditor",
                          associates[(day_index + unit) % len(associates)], json.dumps({"showcase_demo": True}), stamp.isoformat(),
-                         stamp.isoformat(), stamp.isoformat(), "demo.reviewer", 90 if is_defect else 100, int(not critical),
+                         stamp.isoformat(), stamp.isoformat(), user, 90 if is_defect else 100, int(not critical),
                          int(critical), 10, int(is_defect), stamp.isoformat(), user))
             if is_defect and defect_name:
                 item_id = back_items[defect_name]
@@ -590,7 +590,7 @@ def _seed_showcase_data(con, user: str) -> dict[str, Any]:
                        opportunities,defect_count,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (aid, front_pid, f"SHOW-F-{day_index:02d}", front_card, "REVIEWED", "demo.auditor",
                      associates[day_index % len(associates)], json.dumps({"showcase_demo": True}), stamp.isoformat(), stamp.isoformat(),
-                     stamp.isoformat(), "demo.reviewer", 82 if critical else 96, int(not critical), int(critical), 12, int(critical),
+                     stamp.isoformat(), user, 82 if critical else 96, int(not critical), int(critical), 12, int(critical),
                      stamp.isoformat(), user))
         for item_id in front_scorable[:4]:
             con.execute("INSERT INTO audit_responses(audit_id,item_id,passed,score,notes) VALUES(?,?,1,100,'Synthetic showcase response')", (aid, item_id))

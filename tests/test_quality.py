@@ -224,6 +224,12 @@ class QualityCommandCenterTests(unittest.TestCase):
         enabled = quality.toggle_showcase_data(quality.ShowcaseToggleIn(enabled=True), user="admin")
         self.assertTrue(enabled["enabled"])
         self.assertEqual(enabled["counts"], {"processes": 2, "scorecards": 2, "audits": 181, "capas": 5})
+        with app.db() as con:
+            invalid_reviewers = con.execute(
+                """SELECT COUNT(*) FROM audit_cases a LEFT JOIN users u ON u.username=a.reviewed_by
+                   WHERE a.audit_id LIKE 'DEMO-%' AND a.reviewed_by IS NOT NULL AND u.username IS NULL"""
+            ).fetchone()[0]
+            self.assertEqual(invalid_reviewers, 0)
         again = quality.toggle_showcase_data(quality.ShowcaseToggleIn(enabled=True), user="admin")
         self.assertEqual(again["account_id"], enabled["account_id"])
         self.assertEqual(quality.analytics_payload(enabled["account_id"], None, None, None)["stability"], "stable")
